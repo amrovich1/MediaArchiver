@@ -1,9 +1,15 @@
 package com.mediaarchiver
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -12,6 +18,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
@@ -24,8 +32,10 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -37,46 +47,122 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/**
+ * Finds the first http(s) link inside any text and strips junk around it
+ * (spaces, dashes, quotes, brackets, Arabic punctuation, invisible direction marks).
+ */
+fun cleanUrl(raw: String?): String? {
+    if (raw == null) return null
+    val match = Regex("https?://\\S+", RegexOption.IGNORE_CASE).find(raw) ?: return null
+    val junk = "-–—.,;!?\"'()[]{}<>،؛"
+    val cleaned = match.value.trim { ch ->
+        ch.isWhitespace() || ch.category == CharCategory.FORMAT || junk.indexOf(ch) >= 0
+    }
+    return if (cleaned.length > 8) cleaned else null
+}
+
 class MainActivity : ComponentActivity() {
+
+    private val sharedUrl = mutableStateOf<String?>(null)
+
+    private val notificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        setContent { AppRoot() }
+        requestNotificationPermissionIfNeeded()
+
+        if (savedInstanceState == null) {
+            handleShareIntent(intent)
+        }
+        addOnNewIntentListener { newIntent -> handleShareIntent(newIntent) }
+
+        setContent { AppRoot(sharedUrl) }
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    private fun handleShareIntent(i: Intent?) {
+        if (i == null || i.action != Intent.ACTION_SEND) return
+        val text = i.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
+        val url = cleanUrl(text) ?: cleanUrl(i.dataString)
+        if (url != null) {
+            sharedUrl.value = url
+        } else {
+            DownloadState.status.value = "لم أجد رابطاً في النص المشترك."
+        }
     }
 }
 
 @Composable
-fun AppRoot() {
+fun AppRoot(sharedUrl: MutableState<String?>) {
     val dark = isSystemInDarkTheme()
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         MaterialTheme(colorScheme = if (dark) darkColorScheme() else lightColorScheme()) {
             Surface(modifier = Modifier.fillMaxSize()) {
-                MainScreen()
+                MainScreen(sharedUrl)
             }
         }
     }
 }
 
 @Composable
-fun MainScreen() {
+fun MainScreen(sharedUrl: MutableState<String?>) {
     val appContext = LocalContext.current.applicationContext
     val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
 
+    val busy by DownloadState.busy.collectAsState()
+    val progress by DownloadState.progress.collectAsState()
+    val status by DownloadState.status.collectAsState()
+
     var url by rememberSaveable { mutableStateOf("") }
     var audioOnly by rememberSaveable { mutableStateOf(false) }
-    var status by remember { mutableStateOf("جاهز. الصق الرابط ثم اضغط ابدأ.") }
-    var progress by remember { mutableFloatStateOf(0f) }
-    var busy by remember { mutableStateOf(false) }
+    var working by remember { mutableStateOf(false) }
+    var hasCookies by remember { mutableStateOf(Downloader.hasCookies(appContext)) }
+
+    val locked = busy || working
+
+    // A link arrived from the Share menu.
+    val shared = sharedUrl.value
+    LaunchedEffect(shared) {
+        if (shared != null) {
+            url = shared
+            sharedUrl.value = null
+            if (!DownloadState.busy.value) {
+                DownloadState.status.value =
+                    "تم استلام الرابط من المشاركة ✓ اختر فيديو أو صوت ثم اضغط ابدأ."
+            }
+        }
+    }
+
+    val cookiePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            val ok = Downloader.importCookies(appContext, uri)
+            hasCookies = Downloader.hasCookies(appContext)
+            DownloadState.status.value =
+                if (ok) "تم استيراد ملف الكوكيز ✓ جرّب التحميل الآن." else "تعذر قراءة ملف الكوكيز."
+        }
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .systemBarsPadding()
+            .verticalScroll(rememberScrollState())
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
@@ -90,7 +176,7 @@ fun MainScreen() {
             onValueChange = { url = it },
             label = { Text("رابط الفيديو أو الصوت") },
             singleLine = true,
-            enabled = !busy,
+            enabled = !locked,
             modifier = Modifier.fillMaxWidth()
         )
 
@@ -98,11 +184,10 @@ fun MainScreen() {
             onClick = {
                 val pasted = clipboard.getText()?.text
                 if (pasted != null) {
-                    val found = Regex("https?://\\S+").find(pasted)
-                    url = if (found != null) found.value else pasted
+                    url = cleanUrl(pasted) ?: pasted
                 }
             },
-            enabled = !busy
+            enabled = !locked
         ) {
             Text("لصق من الحافظة")
         }
@@ -110,42 +195,28 @@ fun MainScreen() {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilterChip(
                 selected = !audioOnly,
-                onClick = { if (!busy) audioOnly = false },
+                onClick = { if (!locked) audioOnly = false },
                 label = { Text("فيديو") }
             )
             FilterChip(
                 selected = audioOnly,
-                onClick = { if (!busy) audioOnly = true },
+                onClick = { if (!locked) audioOnly = true },
                 label = { Text("صوت") }
             )
         }
 
         Button(
             onClick = {
-                val link = url.trim()
-                busy = true
-                progress = 0f
-                status = "جارٍ التحميل… أبقِ التطبيق مفتوحاً."
-                scope.launch {
-                    val message = withContext(Dispatchers.IO) {
-                        try {
-                            val saved = Downloader.download(appContext, link, audioOnly) { p ->
-                                progress = p.coerceIn(0f, 100f) / 100f
-                            }
-                            "تم الحفظ ✓\n" + saved
-                        } catch (e: Exception) {
-                            val reason = (e.message ?: "خطأ غير معروف")
-                                .lines()
-                                .lastOrNull { it.isNotBlank() }
-                                ?: "خطأ غير معروف"
-                            "فشل: " + reason.take(300)
-                        }
-                    }
-                    status = message
-                    busy = false
+                val link = cleanUrl(url)
+                if (link == null) {
+                    DownloadState.status.value = "الرابط غير صالح. تأكد أنه يبدأ بـ http أو https."
+                } else {
+                    url = link
+                    DownloadState.markStarting()
+                    DownloadService.start(appContext, link, audioOnly)
                 }
             },
-            enabled = !busy && url.isNotBlank(),
+            enabled = !locked && url.isNotBlank(),
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("ابدأ التحميل")
@@ -160,7 +231,7 @@ fun MainScreen() {
             } else {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
-            OutlinedButton(onClick = { Downloader.cancel() }) {
+            OutlinedButton(onClick = { DownloadService.cancel(appContext) }) {
                 Text("إلغاء")
             }
         }
@@ -169,5 +240,58 @@ fun MainScreen() {
             text = status,
             style = MaterialTheme.typography.bodyMedium
         )
+
+        Text(
+            text = "أدوات الإصلاح",
+            style = MaterialTheme.typography.titleSmall
+        )
+
+        OutlinedButton(
+            onClick = {
+                working = true
+                DownloadState.status.value = "جارٍ تحديث محرك التحميل…"
+                scope.launch {
+                    val message = withContext(Dispatchers.IO) {
+                        try {
+                            Downloader.updateEngine(appContext)
+                        } catch (e: Exception) {
+                            val reason = (e.message ?: "خطأ غير معروف")
+                                .lines()
+                                .lastOrNull { it.isNotBlank() }
+                                ?: "خطأ غير معروف"
+                            "فشل التحديث: " + reason.take(300)
+                        }
+                    }
+                    DownloadState.status.value = message
+                    working = false
+                }
+            },
+            enabled = !locked,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("تحديث محرك التحميل")
+        }
+
+        OutlinedButton(
+            onClick = { cookiePicker.launch(arrayOf("*/*")) },
+            enabled = !locked,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(if (hasCookies) "استبدال ملف الكوكيز (موجود)" else "استيراد ملف كوكيز (cookies.txt)")
+        }
+
+        if (hasCookies) {
+            OutlinedButton(
+                onClick = {
+                    Downloader.clearCookies(appContext)
+                    hasCookies = false
+                    DownloadState.status.value = "تم حذف ملف الكوكيز."
+                },
+                enabled = !locked,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("حذف ملف الكوكيز")
+            }
+        }
     }
 }
