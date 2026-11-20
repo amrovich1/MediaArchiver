@@ -2,6 +2,7 @@ package com.mediaarchiver
 
 import android.content.ContentValues
 import android.content.Context
+import android.net.Uri
 import android.provider.MediaStore
 import android.webkit.MimeTypeMap
 import com.yausername.ffmpeg.FFmpeg
@@ -23,9 +24,39 @@ object Downloader {
         ready = true
     }
 
+    private fun cookiesFile(ctx: Context): File = File(ctx.filesDir, "cookies.txt")
+
+    fun hasCookies(ctx: Context): Boolean = cookiesFile(ctx).let { it.exists() && it.length() > 0 }
+
+    /** Copies a cookies.txt file chosen by the user into the app's private storage. */
+    fun importCookies(ctx: Context, uri: Uri): Boolean {
+        return try {
+            val input = ctx.contentResolver.openInputStream(uri) ?: return false
+            input.use { i ->
+                cookiesFile(ctx).outputStream().use { o -> i.copyTo(o) }
+            }
+            cookiesFile(ctx).length() > 0
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    fun clearCookies(ctx: Context) {
+        cookiesFile(ctx).delete()
+    }
+
+    /** Blocking: downloads the latest yt-dlp engine. Run from a background thread. */
+    fun updateEngine(ctx: Context): String {
+        ensureInit(ctx)
+        val status = YoutubeDL.getInstance().updateYoutubeDL(ctx, YoutubeDL.UpdateChannel._STABLE)
+        val version = YoutubeDL.getInstance().versionName(ctx)
+        return "تحديث المحرك: " + status + " | الإصدار: " + version
+    }
+
     /**
-     * Blocking call: run it from a background thread (Dispatchers.IO).
+     * Blocking call: run it from a background thread.
      * Returns a short text describing where the file was saved.
+     * The temporary folder is always deleted, even when the download fails.
      */
     fun download(
         ctx: Context,
@@ -41,34 +72,40 @@ object Downloader {
         )
         workDir.mkdirs()
 
-        val request = YoutubeDLRequest(url)
-        request.addOption("--no-playlist")
-        request.addOption("--no-mtime")
-        request.addOption("--embed-metadata")
-        request.addOption("-o", workDir.absolutePath + "/%(title).60s [%(id)s].%(ext)s")
+        try {
+            val request = YoutubeDLRequest(url)
+            request.addOption("--no-playlist")
+            request.addOption("--no-mtime")
+            request.addOption("--embed-metadata")
+            request.addOption("-o", workDir.absolutePath + "/%(title).60s [%(id)s].%(ext)s")
 
-        if (audioOnly) {
-            request.addOption("-f", "ba[ext=m4a]/ba/b")
-            request.addOption("-x")
-            request.addOption("--audio-format", "m4a")
-        } else {
-            request.addOption("-f", "bv*[height<=?720]+ba/b[height<=?720]")
-            request.addOption("-S", "res,ext:mp4:m4a")
-            request.addOption("--merge-output-format", "mp4")
+            if (hasCookies(ctx)) {
+                request.addOption("--cookies", cookiesFile(ctx).absolutePath)
+            }
+
+            if (audioOnly) {
+                request.addOption("-f", "ba[ext=m4a]/ba/b")
+                request.addOption("-x")
+                request.addOption("--audio-format", "m4a")
+            } else {
+                request.addOption("-f", "bv*[height<=?720]+ba/b[height<=?720]")
+                request.addOption("-S", "res,ext:mp4:m4a")
+                request.addOption("--merge-output-format", "mp4")
+            }
+
+            YoutubeDL.getInstance().execute(request, "mvp-download") { progress, _, _ ->
+                onProgress(progress)
+            }
+
+            val result = workDir.listFiles()
+                ?.filter { it.isFile && it.extension.lowercase() in MEDIA_EXT }
+                ?.maxByOrNull { it.length() }
+                ?: throw IllegalStateException("لم يتم إنتاج أي ملف")
+
+            return saveToDevice(ctx, result, audioOnly)
+        } finally {
+            workDir.deleteRecursively()
         }
-
-        YoutubeDL.getInstance().execute(request, "mvp-download") { progress, _, _ ->
-            onProgress(progress)
-        }
-
-        val result = workDir.listFiles()
-            ?.filter { it.isFile && it.extension.lowercase() in MEDIA_EXT }
-            ?.maxByOrNull { it.length() }
-            ?: throw IllegalStateException("لم يتم إنتاج أي ملف")
-
-        val savedPath = saveToDevice(ctx, result, audioOnly)
-        workDir.deleteRecursively()
-        return savedPath
     }
 
     fun cancel() {
