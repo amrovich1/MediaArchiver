@@ -104,15 +104,24 @@ class DownloadService : Service() {
             var message = ""
             try {
                 var lastNotify = 0L
-                val saved = Downloader.download(applicationContext, url, audio) { p ->
-                    val percent = p.coerceIn(0f, 100f)
-                    DownloadState.progress.value = percent / 100f
-                    val now = SystemClock.elapsedRealtime()
-                    if (now - lastNotify >= 1000L) {
-                        lastNotify = now
-                        notifyProgress("جارٍ التحميل: " + percent.toInt() + "%", percent.toInt())
+                val saved = Downloader.download(
+                    applicationContext,
+                    url,
+                    audio,
+                    { text ->
+                        DownloadState.status.value = text
+                        notifyProgress(text, 0)
+                    },
+                    { p ->
+                        val percent = p.coerceIn(0f, 100f)
+                        DownloadState.progress.value = percent / 100f
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastNotify >= 1000L) {
+                            lastNotify = now
+                            notifyProgress("جارٍ التحميل: " + percent.toInt() + "%", percent.toInt())
+                        }
                     }
-                }
+                )
                 ok = true
                 message = "تم الحفظ ✓\n" + saved
             } catch (e: Exception) {
@@ -140,6 +149,9 @@ class DownloadService : Service() {
 
     private fun shortReason(e: Exception): String {
         val text = e.message ?: "خطأ غير معروف"
+        if (e is DownloadFailedException) {
+            return text.take(1500)
+        }
         val last = text.lines().lastOrNull { it.isNotBlank() } ?: "خطأ غير معروف"
         return last.take(300)
     }
@@ -173,7 +185,7 @@ class DownloadService : Service() {
     private fun progressNotification(text: String, percent: Int, indeterminate: Boolean): Notification {
         return NotificationCompat.Builder(this, CHANNEL_PROGRESS)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-                        .setContentTitle(getString(R.string.app_name))
+            .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
             .setProgress(100, percent, indeterminate)
             .setOngoing(true)
