@@ -19,6 +19,25 @@ android {
         }
     }
 
+    // A fixed signing key (created once by the GitHub workflow) so that new
+    // versions can always be installed over the old one.
+    signingConfigs {
+        create("contentslayer") {
+            storeFile = file("contentslayer.jks")
+            storePassword = System.getenv("KS_PASS")
+            keyAlias = "contentslayer"
+            keyPassword = System.getenv("KS_PASS")
+        }
+    }
+
+    buildTypes {
+        debug {
+            if (file("contentslayer.jks").exists()) {
+                signingConfig = signingConfigs.getByName("contentslayer")
+            }
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
