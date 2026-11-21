@@ -5,12 +5,20 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       ANDROID_HOME: /usr/local/lib/android/sdk
+      KS_PASS: contentslayer-signing-key
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,13 +40,48 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      - name: Prepare signing key (created once, then reused for every build)
+        run: |
+          mkdir -p signing
+          if [ ! -f signing/keystore.b64 ]; then
+            keytool -genkeypair -keystore /tmp/contentslayer.jks -storetype PKCS12 \
+              -alias contentslayer -keyalg RSA -keysize 2048 -validity 36500 \
+              -storepass "$KS_PASS" -dname "CN=ContentSlayer, O=Personal, C=EG"
+            base64 -w0 /tmp/contentslayer.jks > signing/keystore.b64
+            echo "NEW_KEY=1" >> "$GITHUB_ENV"
+            echo "A new signing key was created."
+          else
+            echo "Existing signing key found."
+          fi
+          base64 -d signing/keystore.b64 > app/contentslayer.jks
+
+      - name: Download fonts (Tajawal, OFL license)
+        run: |
+          mkdir -p app/src/main/assets/fonts
+          for w in Regular Medium Bold; do
+            f="app/src/main/assets/fonts/Tajawal-$w.ttf"
+            curl -fsSL --retry 3 -o "$f" "https://raw.githubusercontent.com/google/fonts/main/ofl/tajawal/Tajawal-$w.ttf" \
+              || { echo "Font $w download failed - the app will use the system font."; rm -f "$f"; }
+          done
+
       - name: Build debug APK
         run: gradle assembleDebug --stacktrace
+
+      - name: Save signing key into the repository (first run only)
+        if: env.NEW_KEY == '1'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add signing/keystore.b64
+          git commit -m "Add ContentSlayer signing key"
+          git push
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/*.apk ContentSlayer.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MediaArchiver-APK
-          path: app/build/outputs/apk/debug/*.apk
+          name: ContentSlayer-APK
+          path: ContentSlayer.apk
           if-no-files-found: error
-          
