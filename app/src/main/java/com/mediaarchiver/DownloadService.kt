@@ -173,7 +173,7 @@ class DownloadService : Service() {
     private fun progressNotification(text: String, percent: Int, indeterminate: Boolean): Notification {
         return NotificationCompat.Builder(this, CHANNEL_PROGRESS)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("أرشيف الوسائط")
+                        .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
             .setProgress(100, percent, indeterminate)
             .setOngoing(true)
