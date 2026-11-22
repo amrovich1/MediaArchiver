@@ -503,7 +503,7 @@ fun MainScreen(sharedUrl: MutableState<String?>) {
                         modifier = Modifier
                             .widthIn(max = 480.dp)
                             .fillMaxWidth()
-                                                .verticalScroll(rememberScrollState()),
+                            .verticalScroll(rememberScrollState()),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
@@ -1036,27 +1036,3 @@ private fun RepairPanel(
         )
     }
 }
-PoTokenChange,
-            label = { Text("PO Token") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        OutlinedTextField(
-            value = visitorData,
-            onValueChange = onVisitorDataChange,
-            label = { Text("Visitor Data") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        Button(
-            onClick = onSaveAdvanced,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("حفظ")
-        }
-
-        Text(
-            text = "الصيغة: web.gvs+TOKEN. الـ PO Token مرتبط غالباً بفيديو واحد وينتهي بسرعة، فالإدخال اليدوي محدود الفائدة.",
-            style = M
