@@ -556,4 +556,231 @@ private class ProgressTracker(
         val downloaded = completed + (streamTotal * (p / 100.0)).toLong()
         val known = completed + streamTotal
         val total = if (estimated > 0) maxOf(estimated, downloaded) else maxOf(known, downloaded)
-        val fr
+        val fraction = if (total > 0) {
+            (downloaded.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
+        } else {
+            p / 100f
+        }
+        val approximate = estimated > 0 || !audioOnly
+        val text = formatBytes(downloaded) + " / " + (if (approximate) "≈ " else "") + formatBytes(total)
+        return Pair(fraction, text)
+    }
+}
+
+// ============================ One download (pause / resume / cancel) ============================
+
+class DownloadSession(
+    private val ctx: Context,
+    private val spec: DownloadSpec,
+    private val listener: Listener
+) {
+
+    interface Listener {
+        fun onStatus(text: String)
+        fun onProgress(fraction: Float, bytesText: String)
+    }
+
+    private val lock = ReentrantLock()
+    private val unpaused = lock.newCondition()
+
+    @Volatile
+    private var paused = false
+
+    @Volatile
+    private var cancelled = false
+
+    @Volatile
+    private var finishing = false
+
+    private val tracker = ProgressTracker(spec.estimatedBytes, spec.audioOnly)
+
+    /** Stops the running yt-dlp process (partial files are kept). Returns false if too late. */
+    fun pause(): Boolean {
+        if (finishing || cancelled) return false
+        paused = true
+        killProcess()
+        // A process might be starting right now: make sure it is stopped too.
+        Thread {
+            for (i in 1..3) {
+                try {
+                    Thread.sleep(500)
+                } catch (e: InterruptedException) {
+                    return@Thread
+                }
+                if (paused && !cancelled) {
+                    killProcess()
+                } else {
+                    return@Thread
+                }
+            }
+        }.start()
+        return true
+    }
+
+    fun resume() {
+        lock.withLock {
+            paused = false
+            unpaused.signalAll()
+        }
+    }
+
+    /** Returns false if the file is already being saved. */
+    fun cancel(): Boolean {
+        if (finishing) return false
+        cancelled = true
+        lock.withLock {
+            paused = false
+            unpaused.signalAll()
+        }
+        killProcess()
+        return true
+    }
+
+    private fun killProcess() {
+        try {
+            YoutubeDL.getInstance().destroyProcessById(Downloader.DOWNLOAD_ID)
+        } catch (e: Exception) {
+            // ignore
+        }
+        Downloader.killStrayFfmpeg()
+    }
+
+    private fun waitIfPaused() {
+        lock.withLock {
+            while (paused && !cancelled) {
+                unpaused.await()
+            }
+        }
+    }
+
+    private fun handleProgress(percent: Float, line: String) {
+        val snapshot = tracker.update(percent, line)
+        listener.onProgress(snapshot.first, snapshot.second)
+    }
+
+    private fun buildRequest(dir: File, attempt: Attempt, youtube: Boolean): YoutubeDLRequest {
+        val request = YoutubeDLRequest(spec.url)
+        request.addOption("--no-playlist")
+        request.addOption("--no-mtime")
+        request.addOption("--embed-metadata")
+        request.addOption("--continue")
+        request.addOption("--retries", "3")
+        request.addOption("--fragment-retries", "3")
+
+        val suffix = if (spec.hasClip) " clip_" + spec.clipStart + "-" + spec.clipEnd else ""
+        request.addOption("-o", dir.absolutePath + "/%(title).50s" + suffix + " [%(id)s].%(ext)s")
+
+        Downloader.addAttemptOptions(request, ctx, attempt, youtube)
+
+        if (spec.audioOnly) {
+            request.addOption("-f", "ba[ext=m4a]/ba/b")
+            request.addOption("-x")
+            request.addOption("--audio-format", "m4a")
+        } else {
+            val h = spec.maxHeight
+            val filter = if (h > 0) "[height<=?" + h + "]" else ""
+            request.addOption("-f", "bv*" + filter + "+ba/b" + filter)
+            request.addOption("-S", "res,ext:mp4:m4a")
+        }
+
+        if (spec.hasClip) {
+            request.addOption(
+                "--download-sections",
+                "*" + clockString(spec.clipStart) + "-" + clockString(spec.clipEnd)
+            )
+        }
+        return request
+    }
+
+    private fun findResult(dir: File): File? {
+        val allowed = if (spec.audioOnly) {
+            setOf("m4a", "mp3", "opus", "ogg", "aac")
+        } else {
+            setOf("mp4", "mkv", "webm", "mov")
+        }
+        // Ignore leftovers such as "Title [id].f137.mp4" and "Title [id].temp.mp4".
+        val leftover = Regex("\\.(f[0-9]+|temp)\\.[A-Za-z0-9]+$")
+        return dir.listFiles()
+            ?.filter {
+                it.isFile && it.extension.lowercase() in allowed && !leftover.containsMatchIn(it.name)
+            }
+            ?.maxByOrNull { it.length() }
+    }
+
+    /**
+     * Blocking: run from a background thread. Returns the saved path text.
+     * Pausing keeps the temporary folder so that resuming continues from the same partial files.
+     */
+    fun run(): String {
+        Downloader.ensureInit(ctx)
+
+        val dir = File(
+            ctx.getExternalFilesDir(null) ?: ctx.filesDir,
+            "tmp/" + System.currentTimeMillis()
+        )
+        dir.mkdirs()
+
+        val youtube = Downloader.isYoutube(spec.url)
+        val preferred = if (spec.hasPreferred) Attempt(spec.preferredClient, spec.preferredCookies) else null
+        val attempts = Downloader.buildAttempts(spec.url, Downloader.hasCookies(ctx), preferred)
+        val errors = ArrayList<String>()
+
+        if (spec.hasClip) {
+            val hint = if (spec.estimatedBytes > 0) {
+                "الحجم المتوقع للمقطع ≈ " + formatBytes(spec.estimatedBytes)
+            } else {
+                "جارٍ تحميل المقطع…"
+            }
+            listener.onProgress(0f, hint)
+        }
+
+        try {
+            var index = 0
+            while (index < attempts.size) {
+                waitIfPaused()
+                if (cancelled) throw DownloadCancelledException()
+
+                val attempt = attempts[index]
+                listener.onStatus(
+                    "المحاولة " + (index + 1) + " من " + attempts.size + " (" + attempt.label() + ")…"
+                )
+                tracker.onNewProcess()
+
+                var threw: Exception? = null
+                try {
+                    val request = buildRequest(dir, attempt, youtube)
+                    YoutubeDL.getInstance().execute(request, Downloader.DOWNLOAD_ID) { percent, _, line ->
+                        handleProgress(percent, line)
+                    }
+                } catch (e: Exception) {
+                    threw = e
+                }
+
+                if (cancelled) throw DownloadCancelledException()
+
+                val result = findResult(dir)
+                if (result != null) {
+                    finishing = true
+                    listener.onStatus("جارٍ حفظ الملف…")
+                    return Downloader.saveToDevice(ctx, result, spec.audioOnly)
+                }
+
+                // Stopped on purpose: wait for "resume" and run the same attempt again.
+                if (paused) continue
+
+                val reason = if (threw != null) {
+                    Downloader.extractReason(threw)
+                } else {
+                    "لم ينتج yt-dlp أي ملف"
+                }
+                errors.add(attempt.label() + ": " + reason)
+
+                if (Downloader.isTerminal(reason)) break
+                index++
+            }
+            throw DownloadFailedException(Downloader.summarize(errors, attempts.size))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+}
