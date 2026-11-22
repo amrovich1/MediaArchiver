@@ -8,22 +8,106 @@ import android.webkit.MimeTypeMap
 import com.yausername.ffmpeg.FFmpeg
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
+import org.json.JSONObject
 import java.io.File
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+// ============================ Models & helpers ============================
 
 /** Thrown when every download attempt failed. The message holds a readable summary. */
 class DownloadFailedException(message: String) : Exception(message)
 
+/** Thrown when the user cancelled (download or link inspection). */
+class DownloadCancelledException : Exception("cancelled")
+
+data class QualityOption(val height: Int, val bytes: Long)
+
+data class MediaInfo(
+    val url: String,
+    val title: String,
+    val durationSec: Int,
+    val qualities: List<QualityOption>,
+    val audioBytes: Long,
+    val bestClient: String?,
+    val bestUsedCookies: Boolean
+)
+
+data class DownloadSpec(
+    val url: String,
+    val audioOnly: Boolean,
+    val maxHeight: Int,
+    val clipStart: Int,
+    val clipEnd: Int,
+    val estimatedBytes: Long,
+    val hasPreferred: Boolean,
+    val preferredClient: String?,
+    val preferredCookies: Boolean
+) {
+    val hasClip: Boolean get() = clipStart >= 0 && clipEnd > clipStart
+}
+
+fun formatBytes(bytes: Long): String {
+    val mb = bytes / 1048576.0
+    return if (mb >= 1024.0) {
+        String.format(Locale.US, "%.2f GB", mb / 1024.0)
+    } else {
+        String.format(Locale.US, "%.1f MB", mb)
+    }
+}
+
+/** m:ss or h:mm:ss */
+fun formatTime(totalSec: Int): String {
+    val h = totalSec / 3600
+    val m = (totalSec % 3600) / 60
+    val s = totalSec % 60
+    return if (h > 0) {
+        String.format(Locale.US, "%d:%02d:%02d", h, m, s)
+    } else {
+        String.format(Locale.US, "%d:%02d", m, s)
+    }
+}
+
+private fun clockString(totalSec: Int): String {
+    return String.format(
+        Locale.US, "%d:%02d:%02d",
+        totalSec / 3600, (totalSec % 3600) / 60, totalSec % 60
+    )
+}
+
+internal data class Attempt(val client: String?, val useCookies: Boolean) {
+    fun label(): String {
+        val name = client ?: "default"
+        return if (useCookies) name + " + كوكيز" else name
+    }
+}
+
+private fun jsonStr(o: JSONObject, key: String): String? {
+    if (o.isNull(key)) return null
+    val v = o.optString(key, "")
+    return if (v.isEmpty()) null else v
+}
+
+private fun jsonNum(o: JSONObject, key: String): Double {
+    if (o.isNull(key)) return 0.0
+    return o.optDouble(key, 0.0)
+}
+
+// ============================ Downloader ============================
+
 object Downloader {
 
-    private const val PROCESS_ID = "mvp-download"
+    internal const val DOWNLOAD_ID = "mvp-download"
+    private const val INSPECT_ID_PREFIX = "mvp-inspect-"
 
     private var ready = false
 
-    @Volatile
-    private var cancelled = false
+    private val inspectGeneration = AtomicInteger(0)
 
-    private val VIDEO_EXT = setOf("mp4", "mkv", "webm", "mov")
-    private val AUDIO_EXT = setOf("m4a", "mp3", "opus", "ogg", "aac")
+    @Volatile
+    private var inspectProcessId: String? = null
 
     // null = yt-dlp default clients. Order: most likely to work without a PO Token first.
     private val YT_CLIENTS: List<String?> = listOf(
@@ -36,15 +120,8 @@ object Downloader {
     // Errors where trying another client is pointless.
     private val TERMINAL_ERRORS = listOf("Unsupported URL", "is not a valid URL")
 
-    private data class Attempt(val client: String?, val useCookies: Boolean) {
-        fun label(): String {
-            val name = client ?: "default"
-            return if (useCookies) name + " + كوكيز" else name
-        }
-    }
-
     @Synchronized
-    private fun ensureInit(ctx: Context) {
+    internal fun ensureInit(ctx: Context) {
         if (ready) return
         YoutubeDL.getInstance().init(ctx)
         FFmpeg.getInstance().init(ctx)
@@ -53,7 +130,7 @@ object Downloader {
 
     // ---------- Cookies ----------
 
-    private fun cookiesFile(ctx: Context): File = File(ctx.filesDir, "cookies.txt")
+    internal fun cookiesFile(ctx: Context): File = File(ctx.filesDir, "cookies.txt")
 
     fun hasCookies(ctx: Context): Boolean = cookiesFile(ctx).let { it.exists() && it.length() > 0 }
 
@@ -111,15 +188,15 @@ object Downloader {
         return "تحديث المحرك: " + status + " | الإصدار: " + version
     }
 
-    // ---------- Download with automatic fallback ----------
+    // ---------- Attempts (clients x cookies) ----------
 
-    private fun isYoutube(url: String): Boolean {
+    internal fun isYoutube(url: String): Boolean {
         val host = (Uri.parse(url).host ?: "").lowercase()
         return host.endsWith("youtube.com") || host.endsWith("youtu.be") ||
             host.endsWith("youtube-nocookie.com")
     }
 
-    private fun buildAttempts(url: String, haveCookies: Boolean): List<Attempt> {
+    internal fun buildAttempts(url: String, haveCookies: Boolean, preferred: Attempt?): List<Attempt> {
         val list = ArrayList<Attempt>()
         if (isYoutube(url)) {
             if (haveCookies) {
@@ -136,25 +213,27 @@ object Downloader {
             if (haveCookies) list.add(Attempt(null, true))
             list.add(Attempt(null, false))
         }
+
+        if (preferred != null) {
+            val index = list.indexOf(preferred)
+            if (index > 0) {
+                list.removeAt(index)
+                list.add(0, preferred)
+            } else if (index < 0) {
+                list.add(0, preferred)
+            }
+        }
         return list
     }
 
-    private fun buildRequest(
+    /** Options shared by inspection and download: timeout, cookies, YouTube client, PO Token. */
+    internal fun addAttemptOptions(
+        request: YoutubeDLRequest,
         ctx: Context,
-        url: String,
-        audioOnly: Boolean,
-        workDir: File,
         attempt: Attempt,
         youtube: Boolean
-    ): YoutubeDLRequest {
-        val request = YoutubeDLRequest(url)
-        request.addOption("--no-playlist")
-        request.addOption("--no-mtime")
-        request.addOption("--embed-metadata")
+    ) {
         request.addOption("--socket-timeout", "20")
-        request.addOption("--retries", "3")
-        request.addOption("--fragment-retries", "3")
-        request.addOption("-o", workDir.absolutePath + "/%(title).60s [%(id)s].%(ext)s")
 
         if (attempt.useCookies) {
             request.addOption("--cookies", cookiesFile(ctx).absolutePath)
@@ -178,29 +257,11 @@ object Downloader {
                 request.addOption("--extractor-args", "youtube:" + args.joinToString(";"))
             }
         }
-
-        if (audioOnly) {
-            request.addOption("-f", "ba[ext=m4a]/ba/b")
-            request.addOption("-x")
-            request.addOption("--audio-format", "m4a")
-        } else {
-            request.addOption("-f", "bv*[height<=?720]+ba/b[height<=?720]")
-            request.addOption("-S", "res,ext:mp4:m4a")
-            request.addOption("--merge-output-format", "mp4")
-        }
-        return request
     }
 
-    private fun findResult(workDir: File, audioOnly: Boolean): File? {
-        val allowed = if (audioOnly) AUDIO_EXT else VIDEO_EXT
-        // Ignore leftover single-stream pieces such as "Title [id].f137.mp4".
-        val piece = Regex("\\.f[0-9]+\\.[A-Za-z0-9]+$")
-        return workDir.listFiles()
-            ?.filter { it.isFile && it.extension.lowercase() in allowed && !piece.containsMatchIn(it.name) }
-            ?.maxByOrNull { it.length() }
-    }
+    // ---------- Error helpers ----------
 
-    private fun extractReason(e: Exception): String {
+    internal fun extractReason(e: Exception): String {
         val text = e.message ?: e.toString()
         val lines = text.lines().map { it.trim() }.filter { it.isNotEmpty() }
         val line = lines.lastOrNull { it.startsWith("ERROR:") }
@@ -209,7 +270,10 @@ object Downloader {
         return line.removePrefix("ERROR:").trim().take(300)
     }
 
-    private fun summarize(errors: List<String>, total: Int): String {
+    internal fun isTerminal(reason: String): Boolean =
+        TERMINAL_ERRORS.any { reason.contains(it, ignoreCase = true) }
+
+    internal fun summarize(errors: List<String>, total: Int): String {
         val grouped = LinkedHashMap<String, MutableList<String>>()
         for (item in errors) {
             val idx = item.indexOf(": ")
@@ -238,74 +302,151 @@ object Downloader {
         return sb.toString().trim()
     }
 
+    // ---------- Link inspection (available qualities + size estimates) ----------
+
     /**
-     * Blocking call: run it from a background thread.
-     * Tries several yt-dlp clients (and with/without cookies) until one works.
-     * Returns a short text describing where the file was saved.
-     * The temporary folder is always deleted.
+     * Blocking: run from a background thread. Tries the same clients as the downloader
+     * and returns the qualities that really exist for this link.
      */
-    fun download(
-        ctx: Context,
-        url: String,
-        audioOnly: Boolean,
-        onStatus: (String) -> Unit,
-        onProgress: (Float) -> Unit
-    ): String {
+    fun inspect(ctx: Context, url: String): MediaInfo {
         ensureInit(ctx)
-        cancelled = false
-
+        val generation = inspectGeneration.incrementAndGet()
         val youtube = isYoutube(url)
-        val attempts = buildAttempts(url, hasCookies(ctx))
+        val attempts = buildAttempts(url, hasCookies(ctx), null)
+        val errors = ArrayList<String>()
 
-        val workDir = File(
-            ctx.getExternalFilesDir(null) ?: ctx.filesDir,
-            "tmp/" + System.currentTimeMillis()
-        )
-        workDir.mkdirs()
+        for (attempt in attempts) {
+            if (inspectGeneration.get() != generation) throw DownloadCancelledException()
 
-        try {
-            val errors = ArrayList<String>()
+            val processId = INSPECT_ID_PREFIX + generation
+            inspectProcessId = processId
 
-            for ((index, attempt) in attempts.withIndex()) {
-                if (cancelled) throw IllegalStateException("cancelled")
-
-                onStatus("المحاولة " + (index + 1) + " من " + attempts.size + " (" + attempt.label() + ")…")
-                onProgress(0f)
-
-                var failure: String? = null
-                try {
-                    val request = buildRequest(ctx, url, audioOnly, workDir, attempt, youtube)
-                    YoutubeDL.getInstance().execute(request, PROCESS_ID) { progress, _, _ ->
-                        onProgress(progress)
-                    }
-                } catch (e: Exception) {
-                    if (cancelled) throw e
-                    failure = extractReason(e)
-                }
-
-                val result = findResult(workDir, audioOnly)
-                if (result != null) {
-                    return saveToDevice(ctx, result, audioOnly)
-                }
-
-                val reason = failure ?: "لم ينتج yt-dlp أي ملف"
-                errors.add(attempt.label() + ": " + reason)
-
-                if (TERMINAL_ERRORS.any { reason.contains(it, ignoreCase = true) }) {
-                    break
-                }
+            var raw: String? = null
+            var failure: String? = null
+            try {
+                val request = YoutubeDLRequest(url)
+                request.addOption("--dump-single-json")
+                request.addOption("--no-playlist")
+                request.addOption("--skip-download")
+                request.addOption("--no-warnings")
+                addAttemptOptions(request, ctx, attempt, youtube)
+                val response = YoutubeDL.getInstance().execute(request, processId) { _, _, _ -> }
+                raw = response.out
+            } catch (e: Exception) {
+                if (inspectGeneration.get() != generation) throw DownloadCancelledException()
+                failure = extractReason(e)
             }
 
-            throw DownloadFailedException(summarize(errors, attempts.size))
-        } finally {
-            workDir.deleteRecursively()
+            if (raw != null) {
+                val info = parseInfo(url, raw, attempt)
+                if (info != null) return info
+                failure = "تعذّر قراءة معلومات الرابط"
+            }
+
+            val reason = failure ?: "خطأ غير معروف"
+            errors.add(attempt.label() + ": " + reason)
+            if (isTerminal(reason)) break
+        }
+        throw DownloadFailedException(summarize(errors, attempts.size))
+    }
+
+    fun cancelInspect() {
+        inspectGeneration.incrementAndGet()
+        val id = inspectProcessId
+        if (id != null) {
+            try {
+                YoutubeDL.getInstance().destroyProcessById(id)
+            } catch (e: Exception) {
+                // ignore
+            }
         }
     }
 
-    fun cancel() {
-        cancelled = true
+    private class VideoFormat(val ext: String, val size: Long, val muxed: Boolean)
+
+    private fun formatSize(f: JSONObject, durationSec: Int): Long {
+        var size = jsonNum(f, "filesize").toLong()
+        if (size <= 0) size = jsonNum(f, "filesize_approx").toLong()
+        if (size <= 0 && durationSec > 0) {
+            size = (jsonNum(f, "tbr") * 125.0 * durationSec).toLong()
+        }
+        return if (size > 0) size else 0L
+    }
+
+    private fun parseInfo(url: String, raw: String, attempt: Attempt): MediaInfo? {
+        val start = raw.indexOf('{')
+        val end = raw.lastIndexOf('}')
+        if (start < 0 || end <= start) return null
+        val root = try {
+            JSONObject(raw.substring(start, end + 1))
+        } catch (e: Exception) {
+            return null
+        }
+
+        val duration = jsonNum(root, "duration").toInt()
+        val title = jsonStr(root, "title") ?: url
+
+        val byHeight = HashMap<Int, ArrayList<VideoFormat>>()
+        var audioBest = 0L
+        var audioBestIsM4a = false
+
+        val formats = root.optJSONArray("formats")
+        if (formats != null) {
+            for (i in 0 until formats.length()) {
+                val f = formats.optJSONObject(i) ?: continue
+                val vcodec = jsonStr(f, "vcodec") ?: "none"
+                val acodec = jsonStr(f, "acodec") ?: "none"
+                val ext = jsonStr(f, "ext") ?: ""
+                val height = jsonNum(f, "height").toInt()
+                val size = formatSize(f, duration)
+                val hasVideo = vcodec != "none"
+                val hasAudio = acodec != "none"
+
+                if (hasVideo && height > 0) {
+                    byHeight.getOrPut(height) { ArrayList() }.add(VideoFormat(ext, size, hasAudio))
+                } else if (!hasVideo && hasAudio) {
+                    val isM4a = ext == "m4a"
+                    if ((isM4a && !audioBestIsM4a) || (isM4a == audioBestIsM4a && size > audioBest)) {
+                        audioBest = size
+                        audioBestIsM4a = isM4a
+                    }
+                }
+            }
+        }
+
+        val qualities = byHeight.entries
+            .filter { it.key >= 144 }
+            .sortedByDescending { it.key }
+            .map { entry ->
+                val list = entry.value
+                val mp4 = list.filter { it.ext == "mp4" }
+                val pool = if (mp4.isNotEmpty()) mp4 else list
+                val chosen = pool.maxByOrNull { it.size }!!
+                val total = if (chosen.size > 0) {
+                    chosen.size + (if (chosen.muxed) 0L else audioBest)
+                } else {
+                    0L
+                }
+                QualityOption(entry.key, total)
+            }
+
+        return MediaInfo(
+            url = url,
+            title = title,
+            durationSec = duration,
+            qualities = qualities,
+            audioBytes = audioBest,
+            bestClient = attempt.client,
+            bestUsedCookies = attempt.useCookies
+        )
+    }
+
+    // ---------- Process helpers ----------
+
+    /** Best effort: stops ffmpeg children that may survive after the yt-dlp process is killed. */
+    internal fun killStrayFfmpeg() {
         try {
-            YoutubeDL.getInstance().destroyProcessById(PROCESS_ID)
+            Runtime.getRuntime().exec(arrayOf("sh", "-c", "pkill -f 'libffmpe[g]\\.so'"))
         } catch (e: Exception) {
             // ignore
         }
@@ -313,7 +454,7 @@ object Downloader {
 
     // ---------- Saving to Movies / Music ----------
 
-    private fun saveToDevice(ctx: Context, file: File, audio: Boolean): String {
+    internal fun saveToDevice(ctx: Context, file: File, audio: Boolean): String {
         val ext = file.extension.lowercase()
         val systemMime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
         val mime = if (audio) {
@@ -358,3 +499,61 @@ object Downloader {
         return baseFolder + "/MediaArchive/" + file.name
     }
 }
+
+// ============================ Progress (downloaded MB / total MB) ============================
+
+private class ProgressTracker(
+    private val estimated: Long,
+    private val audioOnly: Boolean
+) {
+    private var completed = 0L
+    private var streamTotal = 0L
+    private var lastPercent = 0f
+
+    private val sizeRegex = Regex("of\\s+~?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*([KMGT]?i?B)")
+
+    private fun unitMultiplier(unit: String): Double {
+        val u = unit.uppercase(Locale.US)
+        return when {
+            u.startsWith("T") -> 1024.0 * 1024.0 * 1024.0 * 1024.0
+            u.startsWith("G") -> 1024.0 * 1024.0 * 1024.0
+            u.startsWith("M") -> 1024.0 * 1024.0
+            u.startsWith("K") -> 1024.0
+            else -> 1.0
+        }
+    }
+
+    /** Called every time a new yt-dlp process starts (first start or after resume). */
+    @Synchronized
+    fun onNewProcess() {
+        if (lastPercent >= 99.5f) {
+            completed += streamTotal
+            streamTotal = 0L
+        }
+        lastPercent = 0f
+    }
+
+    /** Returns (overall fraction 0..1, text like "45.2 MB / ≈ 180.0 MB"). */
+    @Synchronized
+    fun update(percent: Float, line: String): Pair<Float, String> {
+        val p = percent.coerceIn(0f, 100f)
+
+        // Percent jumped back: a new stream (for example audio after video) started.
+        if (lastPercent - p > 40f) {
+            completed += streamTotal
+            streamTotal = 0L
+        }
+
+        val match = sizeRegex.find(line)
+        if (match != null) {
+            val value = match.groupValues[1].toDoubleOrNull()
+            if (value != null) {
+                streamTotal = (value * unitMultiplier(match.groupValues[2])).toLong()
+            }
+        }
+        lastPercent = p
+
+        val downloaded = completed + (streamTotal * (p / 100.0)).toLong()
+        val known = completed + streamTotal
+        val total = if (estimated > 0) maxOf(estimated, downloaded) else maxOf(known, downloaded)
+        val fr
