@@ -472,18 +472,3 @@ class DownloadService : Service() {
         fun cancelYes(ctx: Context) = send(ctx, ACTION_CANCEL_YES)
     }
 }
-        DownloadState.status.value = "جارٍ التحضير…"
-            DownloadState.phase.value = Phase.Downloading
-            try {
-                ContextCompat.startForegroundService(ctx, intent)
-            } catch (e: Exception) {
-                DownloadState.status.value = "تعذر بدء خدمة التحميل: " + (e.message ?: "")
-                DownloadState.phase.value = Phase.Error
-            }
-        }
-
-        private fun send(ctx: Context, action: String) {
-            try {
-                ctx.startService(Intent(ctx, DownloadService::class.java).setAction(action))
-            } catch (e: Exception) {
- 
