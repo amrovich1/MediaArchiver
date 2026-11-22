@@ -19,31 +19,57 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.flow.MutableStateFlow
 
-/** Shared download state, read by the UI and written by the service. */
+/** The one and only download state. The UI and the notification both read from here. */
+enum class Phase { Idle, Downloading, Paused, Cancelled, Completed, Error }
+
 object DownloadState {
-    val busy = MutableStateFlow(false)
+    val phase = MutableStateFlow(Phase.Idle)
     val progress = MutableStateFlow(0f)
+    val bytesText = MutableStateFlow("")
     val status = MutableStateFlow("جاهز. الصق الرابط ثم اضغط ابدأ.")
-
-    fun markStarting() {
-        busy.value = true
-        progress.value = 0f
-        status.value = "جارٍ التحضير…"
-    }
+    val confirmCancel = MutableStateFlow(false)
 }
 
+/**
+ * Owns the download. Every state change (start, pause, resume, cancel, finish)
+ * happens here, on the main thread, so the screen and the notification always agree.
+ */
 class DownloadService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var worker: Job? = null
 
     @Volatile
-    private var cancelRequested = false
+    private var session: DownloadSession? = null
+    private var worker: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var resumeAfterNo = false
+    private var cancelling = false
+
+    @Volatile
+    private var lastNotify = 0L
+
+    private val listener = object : DownloadSession.Listener {
+        override fun onStatus(text: String) {
+            if (session == null) return
+            DownloadState.status.value = text
+            refreshNotification()
+        }
+
+        override fun onProgress(fraction: Float, bytesText: String) {
+            if (session == null) return
+            DownloadState.progress.value = fraction
+            DownloadState.bytesText.value = bytesText
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastNotify >= 1000L) {
+                lastNotify = now
+                refreshNotification()
+            }
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -59,92 +85,160 @@ class DownloadService : Service() {
         }
 
         when (intent.action) {
-            ACTION_START -> {
-                // Must be called right away after startForegroundService().
-                startInForeground(progressNotification("جارٍ التحضير…", 0, true))
+            ACTION_START -> handleStart(intent)
+            ACTION_PAUSE -> handlePause()
+            ACTION_RESUME -> handleResume()
+            ACTION_REQUEST_CANCEL -> handleRequestCancel()
+            ACTION_CANCEL_NO -> handleCancelNo()
+            ACTION_CANCEL_YES -> handleCancelYes()
+            else -> Unit
+        }
 
-                if (worker?.isActive == true) {
-                    return START_NOT_STICKY
-                }
-
-                val url = intent.getStringExtra(EXTRA_URL)
-                val audio = intent.getBooleanExtra(EXTRA_AUDIO, false)
-                if (url.isNullOrBlank()) {
-                    DownloadState.busy.value = false
-                    DownloadState.status.value = "الرابط غير صالح."
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                    return START_NOT_STICKY
-                }
-                runDownload(url, audio)
-            }
-
-            ACTION_CANCEL -> {
-                if (worker?.isActive == true) {
-                    cancelRequested = true
-                    Downloader.cancel()
-                } else {
-                    stopSelf()
-                }
-            }
-
-            else -> stopSelf()
+        if (session == null && intent.action != ACTION_START) {
+            stopSelf()
         }
         return START_NOT_STICKY
     }
 
-    private fun runDownload(url: String, audio: Boolean) {
-        cancelRequested = false
-        DownloadState.markStarting()
-        getSystemService(NotificationManager::class.java).cancel(RESULT_ID)
-        acquireWakeLock()
+    // ---------- Commands ----------
 
-        worker = scope.launch {
-            var ok = false
-            var message = ""
-            try {
-                var lastNotify = 0L
-                val saved = Downloader.download(
-                    applicationContext,
-                    url,
-                    audio,
-                    { text ->
-                        DownloadState.status.value = text
-                        notifyProgress(text, 0)
-                    },
-                    { p ->
-                        val percent = p.coerceIn(0f, 100f)
-                        DownloadState.progress.value = percent / 100f
-                        val now = SystemClock.elapsedRealtime()
-                        if (now - lastNotify >= 1000L) {
-                            lastNotify = now
-                            notifyProgress("جارٍ التحميل: " + percent.toInt() + "%", percent.toInt())
-                        }
-                    }
-                )
-                ok = true
-                message = "تم الحفظ ✓\n" + saved
-            } catch (e: Exception) {
-                message = if (cancelRequested) {
-                    "تم إلغاء التحميل."
-                } else {
-                    "فشل: " + shortReason(e)
-                }
-            }
+    private fun handleStart(intent: Intent) {
+        // Must be called right away after startForegroundService().
+        startInForeground(buildNotification())
 
-            releaseWakeLock()
-            DownloadState.status.value = message
-            DownloadState.progress.value = 0f
-            DownloadState.busy.value = false
+        if (session != null) return
 
-            withContext(Dispatchers.Main) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                if (!cancelRequested) {
-                    showResult(ok, message)
-                }
-                stopSelf()
-            }
+        val spec = specFromIntent(intent)
+        if (spec == null) {
+            DownloadState.status.value = "الرابط غير صالح."
+            DownloadState.phase.value = Phase.Error
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
         }
+
+        val newSession = DownloadSession(applicationContext, spec, listener)
+        session = newSession
+        resumeAfterNo = false
+        cancelling = false
+        DownloadState.confirmCancel.value = false
+        DownloadState.progress.value = 0f
+        DownloadState.bytesText.value = ""
+        DownloadState.status.value = "جارٍ التحضير…"
+        DownloadState.phase.value = Phase.Downloading
+        acquireWakeLock()
+        refreshNotification()
+
+        worker = scope.launch { runSession(newSession) }
+    }
+
+    private fun handlePause() {
+        val s = session ?: return
+        if (cancelling) return
+        if (DownloadState.phase.value != Phase.Downloading) return
+        if (s.pause()) {
+            releaseWakeLock()
+            DownloadState.status.value = "تم الإيقاف مؤقتاً. اضغط استئناف للمتابعة."
+            DownloadState.phase.value = Phase.Paused
+            refreshNotification()
+        }
+    }
+
+    private fun handleResume() {
+        val s = session ?: return
+        if (cancelling) return
+        DownloadState.confirmCancel.value = false
+        resumeAfterNo = false
+        if (DownloadState.phase.value != Phase.Paused) return
+        acquireWakeLock()
+        DownloadState.status.value = "جارٍ استئناف التحميل…"
+        DownloadState.phase.value = Phase.Downloading
+        s.resume()
+        refreshNotification()
+    }
+
+    /** Cancel was pressed: stop temporarily and ask the user to confirm. */
+    private fun handleRequestCancel() {
+        val s = session ?: return
+        if (cancelling) return
+        val phase = DownloadState.phase.value
+        if (phase == Phase.Downloading) {
+            if (!s.pause()) return
+            resumeAfterNo = true
+            releaseWakeLock()
+            DownloadState.status.value = "تم الإيقاف مؤقتاً. هل تريد إلغاء التحميل؟"
+            DownloadState.phase.value = Phase.Paused
+        } else if (phase == Phase.Paused) {
+            resumeAfterNo = false
+        } else {
+            return
+        }
+        DownloadState.confirmCancel.value = true
+        refreshNotification()
+    }
+
+    /** "No": keep the download. It continues only if it was running before the question. */
+    private fun handleCancelNo() {
+        if (!DownloadState.confirmCancel.value) return
+        DownloadState.confirmCancel.value = false
+        if (resumeAfterNo) {
+            resumeAfterNo = false
+            handleResume()
+        }
+    }
+
+    /** "Yes": stop for good and delete the partial files. */
+    private fun handleCancelYes() {
+        val s = session ?: return
+        DownloadState.confirmCancel.value = false
+        resumeAfterNo = false
+        if (cancelling) return
+        cancelling = true
+        DownloadState.status.value = "جارٍ الإلغاء…"
+        s.cancel()
+        refreshNotification()
+    }
+
+    // ---------- Running the session ----------
+
+    private suspend fun runSession(s: DownloadSession) {
+        var phase: Phase
+        var message: String
+        try {
+            val saved = s.run()
+            phase = Phase.Completed
+            message = "تم الحفظ ✓\n" + saved
+        } catch (e: DownloadCancelledException) {
+            phase = Phase.Cancelled
+            message = "تم إلغاء التحميل."
+        } catch (e: Exception) {
+            phase = Phase.Error
+            message = "فشل: " + shortReason(e)
+        }
+
+        withContext(Dispatchers.Main) {
+            finish(phase, message)
+        }
+    }
+
+    private fun finish(phase: Phase, message: String) {
+        session = null
+        worker = null
+        resumeAfterNo = false
+        cancelling = false
+        releaseWakeLock()
+
+        DownloadState.confirmCancel.value = false
+        DownloadState.status.value = message
+        DownloadState.progress.value = 0f
+        DownloadState.bytesText.value = ""
+        DownloadState.phase.value = phase
+
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        if (phase == Phase.Completed || phase == Phase.Error) {
+            showResult(phase == Phase.Completed, message)
+        }
+        stopSelf()
     }
 
     private fun shortReason(e: Exception): String {
@@ -154,6 +248,21 @@ class DownloadService : Service() {
         }
         val last = text.lines().lastOrNull { it.isNotBlank() } ?: "خطأ غير معروف"
         return last.take(300)
+    }
+
+    private fun specFromIntent(intent: Intent): DownloadSpec? {
+        val url = intent.getStringExtra(EXTRA_URL) ?: return null
+        return DownloadSpec(
+            url = url,
+            audioOnly = intent.getBooleanExtra(EXTRA_AUDIO, false),
+            maxHeight = intent.getIntExtra(EXTRA_HEIGHT, 0),
+            clipStart = intent.getIntExtra(EXTRA_CLIP_START, -1),
+            clipEnd = intent.getIntExtra(EXTRA_CLIP_END, -1),
+            estimatedBytes = intent.getLongExtra(EXTRA_EST, 0L),
+            hasPreferred = intent.getBooleanExtra(EXTRA_HAS_PREF, false),
+            preferredClient = intent.getStringExtra(EXTRA_PREF_CLIENT),
+            preferredCookies = intent.getBooleanExtra(EXTRA_PREF_COOKIES, false)
+        )
     }
 
     // ---------- Notifications ----------
@@ -177,23 +286,50 @@ class DownloadService : Service() {
         )
     }
 
-    private fun notifyProgress(text: String, percent: Int) {
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIF_ID, progressNotification(text, percent, percent <= 0))
+    private fun refreshNotification() {
+        if (session == null) return
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification())
     }
 
-    private fun progressNotification(text: String, percent: Int, indeterminate: Boolean): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_PROGRESS)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
+    private fun buildNotification(): Notification {
+        val phase = DownloadState.phase.value
+        val paused = phase == Phase.Paused
+        val percent = (DownloadState.progress.value * 100f).toInt().coerceIn(0, 100)
+        val bytes = DownloadState.bytesText.value
+
+        val text = if (paused) {
+            var t = "متوقف مؤقتاً"
+            if (percent > 0) t += " • " + percent + "%"
+            if (bytes.isNotEmpty()) t += " • " + bytes
+            t
+        } else if (percent > 0) {
+            var t = "جارٍ التحميل: " + percent + "%"
+            if (bytes.isNotEmpty()) t += " • " + bytes
+            t
+        } else {
+            DownloadState.status.value
+        }
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_PROGRESS)
+            .setSmallIcon(if (paused) android.R.drawable.ic_media_pause else android.R.drawable.stat_sys_download)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
-            .setProgress(100, percent, indeterminate)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setProgress(100, percent, !paused && percent <= 0)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(openAppIntent())
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "إلغاء", cancelIntent())
-            .build()
+
+        if (paused) {
+            builder.addAction(android.R.drawable.ic_media_play, "استئناف", serviceIntent(ACTION_RESUME, 12))
+        } else {
+            builder.addAction(android.R.drawable.ic_media_pause, "إيقاف", serviceIntent(ACTION_PAUSE, 11))
+        }
+        // Cancel opens the app, which pauses the download and asks for confirmation.
+        builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "إلغاء", confirmCancelIntent())
+
+        return builder.build()
     }
 
     private fun showResult(ok: Boolean, text: String) {
@@ -210,10 +346,20 @@ class DownloadService : Service() {
         getSystemService(NotificationManager::class.java).notify(RESULT_ID, notification)
     }
 
-    private fun cancelIntent(): PendingIntent {
-        val intent = Intent(this, DownloadService::class.java).setAction(ACTION_CANCEL)
+    private fun serviceIntent(action: String, requestCode: Int): PendingIntent {
+        val intent = Intent(this, DownloadService::class.java).setAction(action)
         return PendingIntent.getService(
-            this, 1, intent,
+            this, requestCode, intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+    }
+
+    private fun confirmCancelIntent(): PendingIntent {
+        val intent = Intent(this, MainActivity::class.java)
+            .putExtra(MainActivity.EXTRA_CONFIRM_CANCEL, true)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        return PendingIntent.getActivity(
+            this, 13, intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
     }
@@ -227,7 +373,7 @@ class DownloadService : Service() {
         )
     }
 
-    // ---------- Wake lock (time-limited, released as soon as the download ends) ----------
+    // ---------- Wake lock (time-limited, released while paused and when finished) ----------
 
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
@@ -247,12 +393,15 @@ class DownloadService : Service() {
     }
 
     override fun onDestroy() {
-        if (worker?.isActive == true) {
-            cancelRequested = true
-            Downloader.cancel()
-            DownloadState.busy.value = false
+        val s = session
+        if (s != null) {
+            s.cancel()
+            session = null
+            DownloadState.confirmCancel.value = false
             DownloadState.progress.value = 0f
+            DownloadState.bytesText.value = ""
             DownloadState.status.value = "تم إيقاف التحميل."
+            DownloadState.phase.value = Phase.Cancelled
         }
         releaseWakeLock()
         scope.cancel()
@@ -261,34 +410,80 @@ class DownloadService : Service() {
 
     companion object {
         const val ACTION_START = "com.mediaarchiver.START"
-        const val ACTION_CANCEL = "com.mediaarchiver.CANCEL"
-        const val EXTRA_URL = "url"
-        const val EXTRA_AUDIO = "audio"
+        const val ACTION_PAUSE = "com.mediaarchiver.PAUSE"
+        const val ACTION_RESUME = "com.mediaarchiver.RESUME"
+        const val ACTION_REQUEST_CANCEL = "com.mediaarchiver.REQUEST_CANCEL"
+        const val ACTION_CANCEL_NO = "com.mediaarchiver.CANCEL_NO"
+        const val ACTION_CANCEL_YES = "com.mediaarchiver.CANCEL_YES"
+
+        private const val EXTRA_URL = "url"
+        private const val EXTRA_AUDIO = "audio"
+        private const val EXTRA_HEIGHT = "height"
+        private const val EXTRA_CLIP_START = "clip_start"
+        private const val EXTRA_CLIP_END = "clip_end"
+        private const val EXTRA_EST = "estimated_bytes"
+        private const val EXTRA_HAS_PREF = "has_preferred"
+        private const val EXTRA_PREF_CLIENT = "preferred_client"
+        private const val EXTRA_PREF_COOKIES = "preferred_cookies"
 
         private const val CHANNEL_PROGRESS = "download_progress"
         private const val CHANNEL_RESULT = "download_result"
         private const val NOTIF_ID = 1
         private const val RESULT_ID = 2
 
-        fun start(ctx: Context, url: String, audioOnly: Boolean) {
+        fun start(ctx: Context, spec: DownloadSpec) {
             val intent = Intent(ctx, DownloadService::class.java)
                 .setAction(ACTION_START)
-                .putExtra(EXTRA_URL, url)
-                .putExtra(EXTRA_AUDIO, audioOnly)
+                .putExtra(EXTRA_URL, spec.url)
+                .putExtra(EXTRA_AUDIO, spec.audioOnly)
+                .putExtra(EXTRA_HEIGHT, spec.maxHeight)
+                .putExtra(EXTRA_CLIP_START, spec.clipStart)
+                .putExtra(EXTRA_CLIP_END, spec.clipEnd)
+                .putExtra(EXTRA_EST, spec.estimatedBytes)
+                .putExtra(EXTRA_HAS_PREF, spec.hasPreferred)
+                .putExtra(EXTRA_PREF_CLIENT, spec.preferredClient)
+                .putExtra(EXTRA_PREF_COOKIES, spec.preferredCookies)
+
+            DownloadState.confirmCancel.value = false
+            DownloadState.progress.value = 0f
+            DownloadState.bytesText.value = ""
+            DownloadState.status.value = "جارٍ التحضير…"
+            DownloadState.phase.value = Phase.Downloading
             try {
                 ContextCompat.startForegroundService(ctx, intent)
             } catch (e: Exception) {
-                DownloadState.busy.value = false
                 DownloadState.status.value = "تعذر بدء خدمة التحميل: " + (e.message ?: "")
+                DownloadState.phase.value = Phase.Error
             }
         }
 
-        fun cancel(ctx: Context) {
+        private fun send(ctx: Context, action: String) {
             try {
-                ctx.startService(Intent(ctx, DownloadService::class.java).setAction(ACTION_CANCEL))
+                ctx.startService(Intent(ctx, DownloadService::class.java).setAction(action))
             } catch (e: Exception) {
-                Downloader.cancel()
+                // ignore
             }
         }
+
+        fun pause(ctx: Context) = send(ctx, ACTION_PAUSE)
+        fun resume(ctx: Context) = send(ctx, ACTION_RESUME)
+        fun requestCancel(ctx: Context) = send(ctx, ACTION_REQUEST_CANCEL)
+        fun cancelNo(ctx: Context) = send(ctx, ACTION_CANCEL_NO)
+        fun cancelYes(ctx: Context) = send(ctx, ACTION_CANCEL_YES)
     }
 }
+        DownloadState.status.value = "جارٍ التحضير…"
+            DownloadState.phase.value = Phase.Downloading
+            try {
+                ContextCompat.startForegroundService(ctx, intent)
+            } catch (e: Exception) {
+                DownloadState.status.value = "تعذر بدء خدمة التحميل: " + (e.message ?: "")
+                DownloadState.phase.value = Phase.Error
+            }
+        }
+
+        private fun send(ctx: Context, action: String) {
+            try {
+                ctx.startService(Intent(ctx, DownloadService::class.java).setAction(action))
+            } catch (e: Exception) {
+ 
